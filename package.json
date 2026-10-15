@@ -1,0 +1,17 @@
+{
+  "name": "declare-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A web portal of Declare apps, each its own GitHub repo, that a pi agent edits live \u2014 forking what it changes.",
+  "scripts": {
+    "start": "node server/start.mjs"
+  },
+  "devDependencies": {
+    "declarelang": "github:davidtemkin/declarelang#v0.5.1",
+    "puppeteer-core": "^23.11.1"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}

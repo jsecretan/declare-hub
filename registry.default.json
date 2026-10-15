@@ -1,0 +1,6 @@
+{
+  "apps": [
+    { "id": "dice", "repo": "jsecretan/declare-app-dice", "ref": "main" },
+    { "id": "todo", "repo": "jsecretan/declare-app-todo", "ref": "main" }
+  ]
+}

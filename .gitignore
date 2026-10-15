@@ -1,0 +1,6 @@
+node_modules/
+state/
+apps/
+previews/
+*.log
+.DS_Store

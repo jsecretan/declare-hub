@@ -1,0 +1,483 @@
+/*
+# Windows
+
+`Window` carries all of the chrome — the shadow, the resize band, the title
+bar you drag, the close and zoom lights, and the zoom out of the tile a window
+launched from — and each subclass supplies only its contents:
+
+- `AppWindow` — hosts an app program (apps/<id>/<main>.declare) in an island,
+  with ⑂ (its forks) and ✦ (its assistant) in the title bar.
+- `PreviewWindow` — another fork of an app, fetched to try before choosing it.
+- `ForksWindow`, `ExploreWindow` — in system/github.declare.
+
+Adapted from the Declare desktop (apps/desktop/desktop.declare).
+*/
+
+class Window [ width = 560, height = 400, clip = true,
+    fill = { provided("theme").surface },
+    stroke = { stroke(1, provided("theme").line) },
+
+    inkHi: Color = #0000006B,                    // front-window shadow ink
+    inkLo: Color = #00000047,                    // inactive-window shadow ink
+    shadow = { app.wm.frontWin == this ? shadow(0, 12, 26, this.inkHi) : shadow(0, 5, 14, this.inkLo) },
+
+    title: string = "",
+    active: boolean = { app.wm.frontWin == this },
+
+    // named geometry — every derived position below reads these
+
+    barH: number = 35,                           // title-bar height; content starts below it
+    minW: number = 240,                          // resize floors
+    minH: number = 120,
+    gutter: number = 6,                          // the resize band's reach outside the frame
+    inset: number = 3,                           // …and inside it
+    corner: number = 16,                         // corner strip size (wins over the edges)
+
+    plain: boolean = false,                      // close-only: no resize, shade or zoom
+    chrome: boolean = true,                      // false: a subclass draws its own title strip
+
+    recId: string = { "" + (:id ?? "") },        // my window record's id (wm.list)
+    cls: string = { "" + (:cls ?? "") },         // my window record's kind ("AppWindow", "ForksWindow", …)
+    appId: string = { "" + (:appId ?? "") },     // the app this window belongs to
+
+    // Open zoom: the window grows from where it launched (bornX/bornY, in
+    // window coordinates; -1 = no origin, so it zooms gently from its center)
+
+    // where it is and how big, kept so a reload can put it back
+    trackChanges = ["wx", "wy", "width", "height"],
+    onChange() { app.wm.saveSoon() },
+
+    bornX: number = { :props.bornX ?? -1 },
+    bornY: number = { :props.bornY ?? -1 },
+    bornFrom: View? = null,
+    pivotX = { this.bornX >= 0 ? this.bornX : this.width / 2 },
+    pivotY = { this.bornY >= 0 ? this.bornY : this.height / 2 },
+    born: Animator [ attribute = baseScale, from = { classroot.bornX >= 0 ? 0.15 : 0.85 }, to = 1,
+        duration = 230, motion = cubicOut, started = true ],
+
+    // where it is: drag, spawn and the zoom animators write wx/wy/baseScale
+    wx: number = { :props.wx ?? 0 },
+    wy: number = { :props.wy ?? 0 },
+    baseScale: number = 1,
+    baseRadius: number = 10,
+    bandR: number = { Math.max(2, this.baseRadius - 1) },
+    cornerRadius = { this.baseRadius },
+    x = { this.wx },
+    y = { this.wy },
+    scale = { this.baseScale },
+
+    // Close runs the open in reverse, back to the view it came from
+    closing: boolean = false,
+    beginClose() {
+        if (closing) return
+        closing = true
+        if (bornFrom != null) {
+            const o = app.launcher.originOf(bornFrom)
+            if (o != null) { bornX = o.x - this.x; bornY = o.y - this.y - app.headerH }
+            }
+        this.die.start()
+        },
+    die: Animator [ attribute = baseScale, to = 0.15, duration = 200, motion = cubicIn,
+        onStop() { app.wm.reallyClose(classroot) }
+        ],
+
+    // drag/resize bookkeeping (root-space anchors)
+    px0: number = 0,
+    py0: number = 0,
+    wx0: number = 0,
+    wy0: number = 0,
+    dragging: boolean = false,
+    sizeMode: string = "",                       // "" | "l" "r" "t" "b" and the corners
+    sizeW0: number = 0,
+    sizeH0: number = 0,
+    sizeX0: number = 0,
+    sizeY0: number = 0,
+
+    shaded: boolean = false,
+    zoomed: boolean = false,
+    saveH: number = 0,
+    saveX: number = 0,
+    saveY: number = 0,
+    saveW: number = 0,
+
+    activate() { app.wm.frontId = this.recId; app.wm.raiseWin(this) },
+
+    // a mouse raises on press (so press-drag raises and moves); a finger
+    // raises on the tap or the hold
+    activateOnPress() { if (app.lastPointerType == "mouse") this.activate() },
+    onPointerDown() { this.activateOnPress() },
+    onClick()       { this.activate() },
+    onHold()        { this.activate() },
+
+    // subclass content attaches after the base's children, so the chrome
+    // re-promotes above it. A subclass overriding onInit calls super.onInit().
+    raiseChrome() {
+        this.halo.raise()
+        this.veil.raise()
+        },
+    onInit() {
+        if (:props.width != null) width = :props.width
+        if (:props.height != null) height = :props.height
+        bornFrom = app.launcher.takeBorn(recId)
+        this.raiseChrome()
+        },
+
+    shadeToggle() {
+        if (shaded) { this.height = saveH; shaded = false }
+        else { saveH = this.height; this.height = barH; shaded = true }
+        },
+
+    zoomToggle() {
+        if (zoomed) { this.wx = saveX; this.wy = saveY; this.width = saveW; this.height = saveH; zoomed = false }
+        else {
+            saveX = this.wx; saveY = this.wy; saveW = this.width; saveH = this.height
+            this.wx = 12; this.wy = 8
+            this.width = app.width - 24
+            this.height = app.height - app.headerH - 20
+            zoomed = true
+            }
+        },
+
+    beginDrag() {
+        this.activateOnPress()
+        dragging = true
+        px0 = app.pointerX
+        py0 = app.pointerY
+        wx0 = this.wx
+        wy0 = this.wy
+        },
+    dragTo() {
+        if (!dragging) return
+        this.wx = Math.max(-200, Math.min(app.width - 60, wx0 + app.pointerX - px0))
+        this.wy = Math.max(0, Math.min(app.height - 90, wy0 + app.pointerY - py0))
+        },
+    endDrag(canceled: boolean) {
+        if (canceled) { this.wx = wx0; this.wy = wy0 }
+        dragging = false
+        },
+
+    beginSize(mode: string) {
+        if (plain) return
+        this.activate()
+        sizeMode = "" + mode
+        px0 = app.pointerX
+        py0 = app.pointerY
+        sizeW0 = this.width
+        sizeH0 = this.height
+        sizeX0 = this.wx
+        sizeY0 = this.wy
+        },
+
+    // A left-edge drag keeps the right edge fixed, so x follows the width;
+    // a top-edge drag keeps the bottom fixed, so y follows the height.
+    moveSize() {
+        if (sizeMode == "") return
+        const dx = app.pointerX - px0
+        const dy = app.pointerY - py0
+        const sx = sizeMode.indexOf("r") >= 0 ? 1 : sizeMode.indexOf("l") >= 0 ? -1 : 0
+        const sy = sizeMode.indexOf("b") >= 0 ? 1 : sizeMode.indexOf("t") >= 0 ? -1 : 0
+        const w = sx != 0 ? Math.max(minW, sizeW0 + sx * dx) : sizeW0
+        const h = sy != 0 ? Math.max(minH, sizeH0 + sy * dy) : sizeH0
+        if (sx < 0) this.wx = sizeX0 + (sizeW0 - w)
+        if (sy < 0) this.wy = Math.max(0, sizeY0 + (sizeH0 - h))
+        this.width = w
+        this.height = h
+        },
+
+    lightsHover: boolean = false,
+
+    bar: View [ width = 100%, height = { classroot.barH }, visible = { classroot.chrome },
+        fill = { classroot.active
+                ? (app.darkMode ? gradient(0x3B3B40, 0x2E2E32) : gradient(0xFAFAFC, 0xE6E6EA))
+                : provided("theme").background },
+        onPointerDown() { classroot.beginDrag() },
+        onPointerMove() { classroot.dragTo() },
+        onPointerUp(e: PointerUpEvent) { classroot.endDrag(e.canceled) },
+        onHold() { classroot.activate() },
+        onDblClick() { if (!classroot.plain) classroot.zoomToggle() },
+
+        lights: View [ x = 13, y = 10.5, width = 34, height = 14,
+            onPointerOver() { classroot.lightsHover = true },
+            onPointerOut()  { classroot.lightsHover = false },
+            close: TrafficLight [ x = 0, c = #EC6A5E, rim = #D25349, ink = #7B1006, sym = "close",
+                on = { classroot.active || classroot.lightsHover }, showGlyph = { classroot.lightsHover },
+                onPointerOver() { classroot.lightsHover = true },
+                onPointerOut()  { classroot.lightsHover = false },
+                onClick() { app.wm.closeWin(classroot) }
+                ],
+            zoom: TrafficLight [ x = 20, c = #61C554, rim = #4CAF45, ink = #145E14, sym = "zoom",
+                on = { (classroot.active || classroot.lightsHover) && !classroot.plain }, showGlyph = { classroot.lightsHover },
+                onPointerOver() { classroot.lightsHover = true },
+                onPointerOut()  { classroot.lightsHover = false },
+                onClick() { if (!classroot.plain) classroot.zoomToggle() }
+                ]
+            ],
+
+        cap: Text [ x = center, y = center, fontSize = 13, fontWeight = semibold,
+            textColor = { classroot.active ? provided("theme").text : provided("theme").textMuted },
+            text = { classroot.title } ],
+
+        sep: View [ x = 0, y = { classroot.barH - 1 }, width = 100%, height = 1, fill = { provided("theme").line } ]
+        ],
+
+    // The resize halo: one ring outside the frame (the window clips; the
+    // halo opts out). Its ring-shaped clip makes the interior transparent
+    // to the pointer, so only the band itself takes a grab.
+    halo: View [ ignoreClip = true, visible = { !classroot.plain && !classroot.shaded },
+        x = { -classroot.gutter }, y = { -classroot.gutter },
+        width = { parent.width + 2 * classroot.gutter }, height = { parent.height + 2 * classroot.gutter },
+        clip = { this.ring(classroot.gutter, classroot.inset, classroot.bandR, this.width, this.height) },
+        ring(g: number, n: number, r: number, w: number, h: number) -> Shape {
+            const i = g + n
+            const x1 = w - i
+            const y1 = h - i
+            return "M0 0 H" + w + " V" + h + " H0 Z"
+                 + " M" + i + " " + (i + r)
+                 + " V" + (y1 - r)
+                 + " A" + r + " " + r + " 0 0 0 " + (i + r) + " " + y1
+                 + " H" + (x1 - r)
+                 + " A" + r + " " + r + " 0 0 0 " + x1 + " " + (y1 - r)
+                 + " V" + (i + r)
+                 + " A" + r + " " + r + " 0 0 0 " + (x1 - r) + " " + i
+                 + " H" + (i + r)
+                 + " A" + r + " " + r + " 0 0 0 " + i + " " + (i + r)
+                 + " Z"
+            },
+        zone(px: number, py: number) -> string {
+            const g = classroot.gutter + classroot.inset
+            const c = classroot.corner
+            const w = this.width
+            const h = this.height
+            const hz = px < g + c ? "l" : px >= w - g - c ? "r" : ""
+            const vz = py < g + c ? "t" : py >= h - g - c ? "b" : ""
+            const inL = px < g, inR = px >= w - g, inT = py < g, inB = py >= h - g
+            if (inL || inR) return (inL ? "l" : "r") + vz
+            if (inT || inB) return hz + (inT ? "t" : "b")
+            return hz + vz
+            },
+        onPointerMove() { if (classroot.sizeMode != "") classroot.moveSize() },
+        onPointerDown(e: PointerEvent) { const z = this.zone(e.x, e.y); if (z != "") classroot.beginSize(z) },
+        onPointerUp() { classroot.sizeMode = "" },
+
+        // static per-zone cursors (hits pass through to the halo)
+        cl: View [ x = 0, y = { classroot.corner }, width = { classroot.gutter + classroot.inset }, height = { parent.height - 2 * classroot.corner }, pointerEvents = "auto", cursor = "ew-resize" ],
+        cr: View [ x = { parent.width - classroot.gutter - classroot.inset }, y = { classroot.corner }, width = { classroot.gutter + classroot.inset }, height = { parent.height - 2 * classroot.corner }, pointerEvents = "auto", cursor = "ew-resize" ],
+        ct: View [ x = { classroot.corner }, y = 0, width = { parent.width - 2 * classroot.corner }, height = { classroot.gutter + classroot.inset }, pointerEvents = "auto", cursor = "ns-resize" ],
+        cb: View [ x = { classroot.corner }, y = { parent.height - classroot.gutter - classroot.inset }, width = { parent.width - 2 * classroot.corner }, height = { classroot.gutter + classroot.inset }, pointerEvents = "auto", cursor = "ns-resize" ],
+        ktl: View [ x = 0, y = 0, width = { classroot.corner }, height = { classroot.corner }, pointerEvents = "auto", cursor = "nwse-resize" ],
+        kbr: View [ x = { parent.width - classroot.corner }, y = { parent.height - classroot.corner }, width = { classroot.corner }, height = { classroot.corner }, pointerEvents = "auto", cursor = "nwse-resize" ],
+        ktr: View [ x = { parent.width - classroot.corner }, y = 0, width = { classroot.corner }, height = { classroot.corner }, pointerEvents = "auto", cursor = "nesw-resize" ],
+        kbl: View [ x = 0, y = { parent.height - classroot.corner }, width = { classroot.corner }, height = { classroot.corner }, pointerEvents = "auto", cursor = "nesw-resize" ]
+        ],
+
+    // The first-click veil: a background window's content is covered, so a
+    // click there only raises the window.
+    veil: View [ visible = { !classroot.active },
+        x = 0, y = { classroot.barH },
+        width = 100%, height = { parent.height - classroot.barH },
+        onPointerDown() { classroot.activateOnPress() },
+        onClick()       { classroot.activate() },
+        onHold()        { classroot.activate() }
+        ]
+    ]
+
+
+/*
+## TrafficLight — a window control
+
+A filled circle with a hairline rim; on hover it reveals its glyph.
+*/
+
+class TrafficLight [ y = 0, width = 14, height = 14, cornerRadius = 7,
+    c:   Color = #EC6A5E,
+    rim: Color = #D25349,
+    ink: Color = #7B1006,
+    sym: string = "",                            // "close" | "min" | "zoom"
+    on: boolean = false,
+    showGlyph: boolean = false,
+    faint: Color = #00000014,
+    fill = { on ? c : (app.darkMode ? 0x54545A : 0xD2D2D6) },
+    stroke = { stroke(0.5, on ? rim : this.faint) },
+
+    g: View [ x = 0, y = 0, width = 14, height = 14,
+        visible = { classroot.showGlyph && classroot.on },
+        draw(d: Draw) {
+            d.strokeStyle = classroot.ink
+            d.fillStyle = classroot.ink
+            d.lineCap = "round"
+            if (classroot.sym == "close") {
+                d.lineWidth = 1.6
+                d.beginPath()
+                d.moveTo(4.5, 4.5); d.lineTo(9.5, 9.5)
+                d.moveTo(9.5, 4.5); d.lineTo(4.5, 9.5)
+                d.stroke()
+                }
+            else if (classroot.sym == "min") {
+                d.lineWidth = 1.8
+                d.beginPath()
+                d.moveTo(3.5, 7); d.lineTo(10.5, 7)
+                d.stroke()
+                }
+            else if (classroot.sym == "zoom") {
+                d.beginPath()
+                d.moveTo(4.1, 4.1); d.lineTo(8.5, 4.1); d.lineTo(4.1, 8.5)
+                d.closePath(); d.fill()
+                d.beginPath()
+                d.moveTo(9.9, 9.9); d.lineTo(5.5, 9.9); d.lineTo(9.9, 5.5)
+                d.closePath(); d.fill()
+                }
+            }
+        ]
+    ]
+
+
+/*
+## AppGlyph — an app's icon at any size
+
+A rounded two-hue plate with the app's glyph, read off its registry record,
+so a tile, a window and the fork list always agree.
+*/
+
+class AppGlyph [ width = { this.edge }, height = { this.edge },
+    edge: number = 64,
+    appId: string = "",
+    rec: AppRec? = { app.launcher.byId(this.appId) },
+    cornerRadius = { this.edge * 0.23 }, clip = true,
+    fill = { gradient(hex(this.rec?.hue1, 0x5B8DEF), hex(this.rec?.hue2, 0x3A5BC7)) },
+
+    g: Text [ x = center, y = center, fontWeight = semibold,
+        textColor = { hex(classroot.rec?.ink, 0xFFFFFF) },
+        fontSize = { classroot.edge * ((classroot.rec?.glyph ?? "").length > 2 ? 0.3 : 0.48) },
+        text = { classroot.rec?.glyph ?? "" } ]
+    ]
+
+
+/*
+## AppWindow — an app program inside a window
+
+The window frame around an `AppIsland`, which mounts the app's program as its
+own child app. The window provides its tenant the hub's appearance (`dark`),
+the app's own folder (`base`, for the app's relative data URLs) and the
+store's address (`store`).
+
+Two buttons in its title bar: ⑂ lists the app's forks on GitHub (to try one,
+and switch to it), and ✦ opens the assistant beside this window for this
+app only. The shell draws that chat; the window tells it where it is (on
+open, and whenever it moves or resizes while the chat is open).
+*/
+
+class AppWindow extends Window [ width = 640, height = 460,
+    program: string = { :props.program ?? "" },
+    openRev: number = { :props.rev ?? 0 },       // the hub revision this window's program was loaded at
+    rec: AppRec? = { app.launcher.byId(this.appId) },
+    storeKey: string = { this.appId },
+    topH: number = 0,                            // a strip under the title bar (a preview's)
+
+    // the title is the hosted app's own appName, else the registry's title
+    title = { this.island.childName != "" ? this.island.childName : (this.rec?.title ?? "") },
+
+    island: AppIsland [ x = 0, y = { classroot.barH + classroot.topH }, width = 100%, height = { parent.height - classroot.barH - classroot.topH },
+        onPointerDown() { classroot.activateOnPress() },
+        onClick()       { classroot.activate() },
+        onHold()        { classroot.activate() },
+
+        // programs resolve from the hub's root; app.programPath adds the
+        // revision so an app the agent just changed reloads fresh
+        program = { app.programPath(classroot.program, classroot.openRev) },
+        provides = ["dark", "base", "store"],
+        dark: boolean = { app.darkMode },
+        base: string = { "/" + classroot.program.split("/").slice(0, -1).join("/") + "/" },
+        store: string = { "/api/store/" + classroot.storeKey + "/" }
+        ],
+
+    assisted: boolean = { app.assisting != "" && app.assisting == this.recId },
+    // another window in front: the shell hides the chat with this window
+    covered: boolean = { app.wm.frontId != "" && app.wm.frontId != this.recId },
+    osDark: boolean = { app.darkMode },          // the chat matches the hub's appearance
+    canAssist: boolean = true,
+    assistRect() -> object {
+        return ({ win: this.recId, app: this.appId, title: this.title, covered: this.covered, dark: this.osDark,
+            x: this.wx, y: this.wy + app.headerH, w: this.width, h: this.height })
+        },
+    // the chat is this window's drawer: the corners on its edge go square to join it
+    joinedSide: string = { this.assisted && !this.covered ? app.assistSide : "" },
+    cornerRadius = { this.joinedSide == "right" ? [this.baseRadius, 0, 0, this.baseRadius]
+        : this.joinedSide == "left" ? [0, this.baseRadius, this.baseRadius, 0] : this.baseRadius },
+    trackChanges = ["wx", "wy", "width", "height", "covered", "osDark"],
+    toggleAssist() {
+        if (this.assisted) app.post("assist", ({ close: true }))
+        else app.post("assist", this.assistRect())
+        },
+    onChange() {
+        super.onChange()
+        if (this.assisted) app.post("assist", this.assistRect())
+        },
+
+    forks: TitleButton [ x = { parent.width - 62 }, visible = { classroot.chrome && classroot.canAssist },
+        glyph = "fork", tooltipLabel = { "Other versions of " + classroot.title + " on GitHub" },
+        onPointerDown() { classroot.activateOnPress() },
+        onClick() { app.launcher.openForks(classroot.appId, this) } ],
+    assist: TitleButton [ x = { parent.width - 34 }, visible = { classroot.chrome && classroot.canAssist },
+        glyph = "✦", on = { classroot.assisted }, tooltipLabel = { "Ask the assistant to change " + classroot.title },
+        onPointerDown() { classroot.activateOnPress() },
+        onClick() { classroot.toggleAssist() } ]
+    ]
+
+
+// a small glyph button in a window's title bar ("fork" draws the fork mark)
+class TitleButton [ y = 6.5, width = 24, height = 22, cornerRadius = 6, cursor = "pointer",
+    glyph: string = "",
+    on: boolean = false,
+    ink: Color = { this.on ? 0xFFFFFF : provided("theme").textMuted },
+    fill = { this.on ? 0x7B5CFF : this.hovered ? (app.darkMode ? 0xFFFFFF1F : 0x0000000F) : 0x00000000 },
+    Text [ visible = { classroot.glyph != "fork" }, x = center, y = center, fontSize = 13,
+        textColor = { classroot.ink }, text = { classroot.glyph } ],
+    ForkMark [ visible = { classroot.glyph == "fork" }, x = center, y = center, ink = { classroot.ink } ]
+    ]
+
+// the fork mark: two branches joining into one
+class ForkMark [ width = 14, height = 14,
+    ink: Color = 0xFFFFFF,
+    draw(d: Draw) {
+        const c = "#" + ("000000" + (this.ink >>> 0).toString(16)).slice(-6)
+        d.strokeStyle = c
+        d.fillStyle = c
+        d.lineWidth = 1.4
+        d.lineCap = "round"
+        d.beginPath()
+        d.moveTo(3.5, 4.5); d.lineTo(3.5, 6); d.quadraticCurveTo(3.5, 8, 7, 8); d.quadraticCurveTo(10.5, 8, 10.5, 6); d.lineTo(10.5, 4.5)
+        d.moveTo(7, 8); d.lineTo(7, 10)
+        d.stroke()
+        for (const p of [[3.5, 2.8], [10.5, 2.8], [7, 11.6]]) { d.beginPath(); d.arc(p[0], p[1], 1.9, 0, Math.PI * 2); d.stroke() }
+        }
+    ]
+
+
+/*
+## PreviewWindow — another fork, to try before choosing it
+
+The fork's program, fetched at one commit, running in its own store (so
+trying it can't touch the app's saved data), under a strip that says whose
+it is and offers to switch to it.
+*/
+
+class PreviewWindow extends AppWindow [
+    repo: string = { "" + (:props.repo ?? "") },
+    sha: string = { "" + (:props.sha ?? "") },
+    note: string = { "" + (:props.note ?? "") },
+    storeKey = { this.appId + "-preview" },
+    canAssist = false,
+    topH = 40,
+    title = { (this.rec?.title ?? "") + " — " + this.repo.split("/")[0] + "'s version" },
+    strip: View [ x = 0, y = { classroot.barH }, width = 100%, height = { classroot.topH },
+        fill = { app.darkMode ? 0x2B2540 : 0xEEE9FF },
+        Text [ x = 12, y = 5, fontSize = 12, fontWeight = semibold, textColor = { provided("theme").text },
+            wrap = false, clip = true, width = { parent.width - 130 },
+            text = { "Trying " + classroot.repo + " @ " + classroot.sha.slice(0, 7) } ],
+        Text [ x = 12, y = 21, fontSize = 11, textColor = { provided("theme").textMuted },
+            wrap = false, clip = true, width = { parent.width - 130 },
+            text = { classroot.note != "" ? classroot.note : "Its own saved data — yours is untouched" } ],
+        Button [ x = { parent.width - this.width - 10 }, y = 6, label = "Use this", primary = true,
+            onClick() { app.launcher.useFork(classroot.appId, classroot.repo, classroot.sha, classroot) } ]
+        ]
+    ]

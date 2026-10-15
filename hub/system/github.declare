@@ -1,0 +1,173 @@
+/*
+# The GitHub windows
+
+- `ForksWindow` — every version of one app on GitHub: the root of its fork
+  network and the forks of it, newest push first, each compared with the
+  commit the hub runs. Try one (a `PreviewWindow` beside it) or use it
+  straight away; either way the registry follows.
+- `ExploreWindow` — Declare apps anyone has published (repos with the
+  `declare-app` topic), to add to the hub.
+
+The bridge does the GitHub calls (`/api/forks/<id>`, `/api/explore`); these
+windows only show what it answers.
+*/
+
+schema ForkRec [ repo: string, owner: string, branch: string, description?: string, pushed?: string,
+    stars?: number, ahead?: number, behind?: number, head?: string, lastMessage?: string,
+    current: boolean, mine: boolean ]
+schema FoundRec [ repo: string, owner: string, description?: string, stars?: number, pushed?: string, inHub: boolean ]
+
+script {
+    // "3 days ago", "today" — for a push date
+    function ago(iso: string | undefined): string {
+        if (iso == null || iso == "") return ""
+        const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000)
+        if (days < 1) return "today"
+        if (days == 1) return "yesterday"
+        if (days < 45) return days + " days ago"
+        return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })
+    }
+    // how a fork stands against the version the hub runs
+    function standing(ahead: number | null | undefined, behind: number | null | undefined, current: boolean): string {
+        if (ahead == null || behind == null) return "history unrelated to yours"
+        if (ahead == 0 && behind == 0) return current ? "this is what you run" : "same as what you run"
+        const parts = [] as string[]
+        if (ahead > 0) parts.push(ahead + (ahead == 1 ? " change" : " changes") + " you don't have")
+        if (behind > 0) parts.push(behind + " behind yours")
+        return parts.join(" · ")
+    }
+}
+
+
+// a window whose body is a scrolling list under a heading
+class ListWindow extends Window [ width = 420, height = 520,
+    heading: string = "",
+    sub: string = "",
+    headH: number = 64,
+    head: View [ x = 0, y = { classroot.barH }, width = 100%, height = { classroot.headH }, padding = [12, 16, 8, 16],
+        Text [ x = 0, y = 0, fontSize = 16, fontWeight = bold, textColor = { provided("theme").text },
+            wrap = false, clip = true, width = 100%, text = { classroot.heading } ],
+        Text [ x = 0, y = 24, fontSize = 12, textColor = { provided("theme").textMuted },
+            wrap = false, clip = true, width = 100%, text = { classroot.sub } ]
+        ]
+    ]
+
+
+/*
+## ForksWindow
+*/
+
+class ForksWindow extends ListWindow [
+    rec: AppRec? = { app.launcher.byId(this.appId) },
+    title = { "Versions of " + (this.rec?.title ?? this.appId) },
+    heading = { "Versions of " + (this.rec?.title ?? this.appId) },
+    sub = { this.rec == null ? "" : "You run " + this.rec.repo + " @ " + this.rec.ref.slice(0, 7) + (this.rec.pending ? " (changed here, not on GitHub yet)" : "") },
+
+    family: DataSource [ auto = true, url = { "/api/forks/" + classroot.appId + "?rev=" + app.rev } ],
+    answer: object = { this.family.value },
+    ok: boolean = { this.answer != null && this.answer.ok == true },
+    rows: Dataset [ contents = { { forks: classroot.ok ? classroot.answer.forks : [] } } ],
+    message: string = { this.answer == null ? "Asking GitHub…"
+        : !this.ok ? "" + this.answer.error
+        : this.answer.forks.length <= 1 ? "No one has forked it yet. When someone changes it with their own hub, their version shows up here." : "" },
+
+    body: View [ x = 0, y = { classroot.barH + classroot.headH }, width = 100%,
+        height = { parent.height - classroot.barH - classroot.headH }, scrolls = y, padding = [0, 12, 12, 12],
+        col: View [ width = 100%, layout: SimpleLayout [ axis = y, spacing = 8 ],
+            Text [ visible = { classroot.message != "" }, width = 100%, wrap = true, fontSize = 12.5,
+                textColor = { provided("theme").textMuted }, text = { classroot.message } ],
+            Text [ visible = { app.launcher.problem != "" }, width = 100%, wrap = true, fontSize = 12.5,
+                textColor = #FF6B5B, text = { app.launcher.problem } ],
+            list: View [ width = 100%, datapath = { classroot.rows.value },
+                layout: SimpleLayout [ axis = y, spacing = 8 ],
+                ForkRow [ datapath = :forks[], key = :repo, appId = { classroot.appId } ]
+                ],
+            View [ width = 4, height = 6 ],
+            Button [ label = { "Remove " + (classroot.rec?.title ?? "this app") + " from your hub" },
+                tooltipLabel = "Takes it off your page; its repo stays on GitHub, and Explore can add it back",
+                onClick() { app.launcher.removeApp(classroot.appId); app.wm.closeWin(classroot) } ]
+            ]
+        ]
+    ]
+
+class ForkRow [ width = 100%, cornerRadius = 10, padding = [10, 12, 10, 12],
+    appId: string = "",
+    fill = { :current ? (app.darkMode ? 0x7B5CFF26 : 0x7B5CFF14) : (app.darkMode ? 0xFFFFFF0A : 0x00000008) },
+    stroke = { :current ? stroke(1, 0x7B5CFF80) : stroke(1, app.darkMode ? 0xFFFFFF14 : 0x0000000F) },
+    layout: SimpleLayout [ axis = y, spacing = 3 ],
+    top: View [ width = 100%, height = 22,
+        who: Text [ x = 0, y = center, fontSize = 13.5, fontWeight = semibold, textColor = { provided("theme").text },
+            wrap = false, clip = true, width = { parent.width - parent.acts.width - 8 },
+            text = { "" + :owner + (:mine ? " (you)" : "") + (:current ? "  · running" : "") } ],
+        acts: View [ x = { parent.width - this.width }, y = 0,
+            visible = { !:current },
+            layout: SimpleLayout [ axis = x, spacing = 6 ],
+            Button [ label = "Try", onClick() { app.launcher.preview(classroot.appId, "" + :repo, "" + (:head ?? :branch), "" + (:lastMessage ?? "")) } ],
+            Button [ label = "Use", primary = true, onClick() { app.launcher.useFork(classroot.appId, "" + :repo, "" + (:head ?? :branch), null) } ]
+            ]
+        ],
+    Text [ fontSize = 11.5, textColor = { provided("theme").textMuted }, wrap = false, clip = true, width = 100%,
+        text = { "" + :repo + (("" + (:pushed ?? "")) != "" ? " · pushed " + ago(:pushed) : "") + ((:stars ?? 0) > 0 ? " · ★" + :stars : "") } ],
+    Text [ fontSize = 12, textColor = { (:ahead ?? 0) > 0 ? (app.darkMode ? 0x9F8BFF : 0x5B3FE0) : provided("theme").textMuted },
+        width = 100%, wrap = true, text = { standing(:ahead, :behind, :current == true) } ],
+    Text [ visible = { ("" + (:lastMessage ?? "")) != "" && (:ahead ?? 0) > 0 }, fontSize = 12, italic = true,
+        textColor = { provided("theme").text }, width = 100%, wrap = true, text = { "Latest: " + (:lastMessage ?? "") } ],
+    Text [ visible = { ("" + (:description ?? "")) != "" }, fontSize = 12, textColor = { provided("theme").textMuted },
+        width = 100%, wrap = true, text = { "" + (:description ?? "") } ]
+    ]
+
+
+/*
+## ExploreWindow
+*/
+
+class ExploreWindow extends ListWindow [ width = 560, height = 600,
+    title = "Explore Declare apps",
+    heading = "Declare apps on GitHub",
+    sub = "Repos tagged declare-app. Add one and it opens like the rest.",
+    headH = 108,
+    query: string = "",
+    found: DataSource [ auto = true, url = { "/api/explore?q=" + encodeURIComponent(classroot.query) + "&rev=" + app.rev } ],
+    answer: object = { this.found.value },
+    rows: Dataset [ contents = { { items: classroot.answer != null ? classroot.answer.items : [] } } ],
+    message: string = { this.answer == null ? "Searching GitHub…"
+        : this.answer.ok != true ? "" + this.answer.error
+        : this.answer.items.length == 0 ? "Nothing found." : "" },
+
+    search: TextInput [ x = 16, y = { classroot.barH + 56 }, width = { parent.width - 32 }, height = 34,
+        placeholder = "Search by name or description, then Return",
+        onEnter() { classroot.query = this.text.trim() } ],
+
+
+    body: View [ x = 0, y = { classroot.barH + classroot.headH }, width = 100%,
+        height = { parent.height - classroot.barH - classroot.headH }, scrolls = y, padding = [0, 12, 12, 12],
+        col: View [ width = 100%, layout: SimpleLayout [ axis = y, spacing = 8 ],
+            Text [ visible = { classroot.message != "" }, width = 100%, wrap = true, fontSize = 12.5,
+                textColor = { provided("theme").textMuted }, text = { classroot.message } ],
+            Text [ visible = { app.launcher.problem != "" }, width = 100%, wrap = true, fontSize = 12.5,
+                textColor = #FF6B5B, text = { app.launcher.problem } ],
+            list: View [ width = 100%, datapath = { classroot.rows.value },
+                layout: SimpleLayout [ axis = y, spacing = 8 ],
+                FoundRow [ datapath = :items[], key = :repo ]
+                ]
+            ]
+        ]
+    ]
+
+class FoundRow [ width = 100%, cornerRadius = 10, padding = [10, 12, 10, 12],
+    fill = { app.darkMode ? 0xFFFFFF0A : 0x00000008 },
+    stroke = { stroke(1, app.darkMode ? 0xFFFFFF14 : 0x0000000F) },
+    layout: SimpleLayout [ axis = y, spacing = 3 ],
+    top: View [ width = 100%, height = 24,
+        Text [ x = 0, y = center, fontSize = 13.5, fontWeight = semibold, textColor = { provided("theme").text },
+            wrap = false, clip = true, width = { parent.width - 90 }, text = { "" + :repo } ],
+        Text [ visible = { :inHub }, x = { parent.width - this.width }, y = center, fontSize = 12,
+            textColor = { provided("theme").textMuted }, text = "In your hub" ],
+        Button [ visible = { !:inHub }, x = { parent.width - this.width }, y = 0, label = "Add",
+            primary = true, onClick() { app.launcher.addApp("" + :repo) } ]
+        ],
+    Text [ visible = { ("" + (:description ?? "")) != "" }, fontSize = 12, textColor = { provided("theme").textMuted },
+        width = 100%, wrap = true, text = { "" + (:description ?? "") } ],
+    Text [ fontSize = 11.5, textColor = { provided("theme").textMuted },
+        text = { "by " + :owner + (("" + (:pushed ?? "")) != "" ? " · pushed " + ago(:pushed) : "") + ((:stars ?? 0) > 0 ? " · ★" + :stars : "") } ]
+    ]

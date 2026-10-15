@@ -1,0 +1,453 @@
+/*
+# Declare Hub — the shell
+
+The one program the agent never edits. It hosts the portal
+(hub/portal.declare) in an island that fills the page, and floats the
+assistant panel above it.
+
+- **The conversation** arrives over one `EventStream` (/api/events) as small
+  operations — reset, push a block, append text to one, patch one, state —
+  which `apply` writes into the `chat` dataset the panel replicates.
+- **A prompt** is one POST (/api/prompt); the reply streams in on the events.
+- **A change** bumps `rev`, handed to the portal with `changed` (which apps):
+  it re-reads the registry and reopens those apps' windows in place on the
+  new code. The portal posts its open windows here as `session`; this keeps
+  them in the tab's sessionStorage, so a reload puts them back. Whether the
+  panel is open is the page's location (`#chat`).
+- **Chats** are all kept by the bridge; History lists them, and opening one
+  brings back its transcript and the agent's memory of it.
+- **An app's ✦** (in its window's title bar) docks the panel beside that
+  window, on that app's own chat: the portal posts `assist` with the window's
+  place (again as it moves), and the bridge keeps that chat's changes inside
+  the app. The header's ✦ Assistant / ⌘J goes back to the general chat.
+*/
+
+script {
+    // a place for the portal's open windows that outlives a reload (this tab only)
+    function keepSession(s: string): void { try { sessionStorage.setItem("declare-hub.session", s) } catch (e) {} }
+    function keptSession(): string { try { return sessionStorage.getItem("declare-hub.session") ?? "" } catch (e) { return "" } }
+
+    // a chat's last activity, briefly: "2:41 PM" today, else "Oct 9"
+    function when(ms: number): string {
+        const d = new Date(ms)
+        const now = new Date()
+        if (d.toDateString() == now.toDateString()) return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+        return d.toLocaleDateString([], { month: "short", day: "numeric" })
+    }
+}
+
+schema ChatItem [ id: string, kind: string, text: string, name?: string, status?: string, output?: string ]
+// what an app window posts when its ✦ is pressed (and as it moves), or { close: true }
+schema AssistPost [ win?: string, app?: string, title?: string, x?: number, y?: number, w?: number, h?: number, covered?: boolean, dark?: boolean, close?: boolean ]
+schema ChatRec [ id: string, title: string, updated: number, count: number, app?: string, appTitle?: string ]
+
+
+/*
+## Transcript blocks — one class per kind, picked by `classFor`
+*/
+
+class Block [ width = 100% ]
+
+class UserBlock extends Block [
+    bubble: View [ x = end, cornerRadius = 14, padding = [8, 12, 8, 12], fill = #0A84FF,
+        width = { Math.min(parent.width * 0.85, this.t.width + 24) },
+        t: Text [ wrap = true, fontSize = 13.5, textColor = #FFFFFF,
+            width = { Math.min(classroot.width * 0.85 - 24, this.contentWidth) },
+            text = :text ]
+        ]
+    ]
+
+class AssistantBlock extends Block [
+    md: Markdown [ width = 100%, fontSize = 13.5, lineHeight = 1.5,
+        bodyColor = { app.cBody }, headingColor = { app.cHead }, linkColor = { app.lite ? 0x0066CC : 0x64D2FF },
+        codeBackground = { app.lite ? 0xE8E8ED : 0x2C2C30 }, codeRule = #7B5CFF,
+        text = :text ]
+    ]
+
+// the model's reasoning: a short window onto its latest lines while it
+// streams (and after), the whole of it on a click. It never shrinks by itself:
+// the log follows its end, and content shrinking under it would undo that.
+class ThinkingBlock extends Block [
+    open: boolean = false,
+    live: boolean = { :status != "done" },
+    cap: number = 68,
+    layout: SimpleLayout [ axis = y, spacing = 4 ],
+    head: View [ height = 20, cursor = "pointer",
+        onClick() { classroot.open = !classroot.open },
+        layout: SimpleLayout [ axis = x, spacing = 6, align = center ],
+        Text [ fontSize = 11, textColor = #8E8E93, text = { classroot.open ? "▾" : "▸" } ],
+        Text [ fontSize = 12, fontWeight = medium, textColor = { app.cMuted },
+            text = { classroot.live ? "Thinking…" : classroot.body.t.height > classroot.cap && !classroot.open ? "Thought · show all" : "Thought" } ]
+        ],
+    body: View [ width = 100%, clip = true, cursor = "pointer",
+        height = { classroot.open ? classroot.body.t.height : Math.min(classroot.body.t.height, classroot.cap) },
+        onClick() { classroot.open = !classroot.open },
+        t: Text [ width = 100%, wrap = true, fontSize = 12, italic = true, textColor = #8E8E93,
+            y = { classroot.open ? 0 : Math.min(0, classroot.cap - this.height) },   // the tail shows
+            text = { "" + :text } ]
+        ]
+    ]
+
+// something the agent did, told in the user's terms ("Changing the Clock app")
+class ToolBlock extends Block [ height = 22,
+    mark: Text [ x = 2, y = center, fontSize = 12, fontWeight = bold,
+        textColor = { :status == "ok" ? 0x30D158 : :status == "error" ? 0xFF9F0A : app.lite ? 0xC79100 : 0xFFD60A },
+        text = { :status == "ok" ? "✓" : :status == "error" ? "!" : "●" } ],
+    what: Text [ x = 20, y = center, fontSize = 12.5, wrap = false, clip = true,
+        width = { parent.width - this.x },
+        textColor = { :status == "running" ? app.cBody : app.lite ? 0x6E6E73 : 0xAEAEB2 },
+        text = { "" + :text + (:status == "running" ? "…" : "") } ]
+    ]
+
+// a saved chat in the History list: press to go back to it
+class ChatRow extends Control [ width = 100%, height = 46, cornerRadius = 9,
+    current: boolean = { :id == app.chatId },
+    fill = { this.current ? 0x0A84FF33 : this.hovered ? app.cWashHi : app.cWash },
+    press() { app.openSaved("" + :id) },
+    t: Text [ x = 12, y = 7, fontSize = 13, fontWeight = medium, textColor = { app.cText }, wrap = false, clip = true,
+        width = { parent.width - 52 }, text = { "" + :title } ],
+    sub: Text [ x = 12, y = 26, fontSize = 11, textColor = { app.cMuted },
+        text = { ("" + (:appTitle ?? "") != "" ? :appTitle + " · " : "") + when(:updated) + " · " + :count + (:count == 1 ? " request" : " requests") + (classroot.current ? " · open now" : "") } ],
+    del: View [ visible = { classroot.hovered }, x = { parent.width - 34 }, y = center, width = 24, height = 24, cornerRadius = 6,
+        fill = { this.hovered ? 0xFF453A40 : 0xFFFFFF00 }, cursor = "pointer", tooltipLabel = "Delete this chat",
+        onClick() { app.forget("" + :id) },
+        Text [ x = center, y = center, fontSize = 12, textColor = #FF9F94, text = "✕" ] ]
+    ]
+
+class SystemBlock extends Block [
+    t: Text [ x = center, width = { Math.min(this.contentWidth, parent.width - 20) }, wrap = true,
+        textAlign = center, fontSize = 11.5, textColor = { app.cMuted }, text = :text ]
+    ]
+
+
+// a suggestion on the empty panel: press it to send it
+class Suggestion extends Control [ width = 100%, height = 34, cornerRadius = 9,
+    label: string = "",
+    fill = { this.hovered ? app.cWashHi : app.cWash },
+    press() { app.send(this.label) },
+    t: Text [ x = 12, y = center, fontSize = 13, textColor = { app.cBody }, text = { classroot.label } ]
+    ]
+
+
+// a small text button in the panel's header
+class HeadButton extends Control [ height = 24, cornerRadius = 6,
+    label: string = "",
+    width = { this.t.width + 16 },
+    fill = { this.hovered && !this.disabled ? app.cWashHi : 0x00000000 },
+    opacity = { this.disabled ? 0.35 : 1 },
+    tooltipLabel = "",
+    act() { },
+    press() { this.act() },
+    t: Text [ x = 8, y = center, fontSize = 12, fontWeight = medium, textColor = { app.cBody }, text = { classroot.label } ]
+    ]
+
+
+App [ appName = "Declare Hub", scrolls = none, fill = #000000,
+    fontFamily = "system-ui, sans-serif",
+    theme = CupertinoDark,
+
+    // ── what the bridge reports ──
+
+    rev: number = 0,                             // 0 until the first state arrives
+    busy: boolean = false,
+    model: string = "unknown",
+    modelName: string = "",
+    canUndo: boolean = false,
+    connected: boolean = { app.events.status == "open" },
+
+    chat: Dataset [ schema = [ blocks[]: ChatItem ] ] { { "blocks": [] } },
+    chats: Dataset [ schema = [ chats[]: ChatRec ] ] { { "chats": [] } },
+    chatId: string = "",
+    historyOpen: boolean = false,
+    changed: string = "",                        // with an apps-only rev: which apps changed
+    chatApp: string = "",                        // the open chat's app ("" = the general assistant)
+    chatAppTitle: string = "",
+    empty: boolean = { (app.chat.value?.blocks ?? []).length == 0 },
+
+    events: EventStream [ url = "/api/events",
+        onMessage(e: StreamMessage) { app.apply(JSON.parse(e.data)) } ],
+
+    apply(m: object) {
+        if (m.op == "reset") app.chat.set(["blocks"], m.blocks)
+        else if (m.op == "push") app.chat.set("/blocks/-", m.block)
+        else if (m.op == "append") {
+            const cur = app.chat.value?.blocks[m.i]
+            if (cur != null) app.chat.set(["blocks", m.i, "text"], cur.text + m.text)
+            }
+        else if (m.op == "chats") {
+            app.chats.set(["chats"], m.chats)
+            app.chatId = m.current
+            app.chatApp = m.app ?? ""
+            app.chatAppTitle = m.appTitle ?? ""
+            }
+        else if (m.op == "patch") { for (const k of Object.keys(m.fields)) app.chat.set(["blocks", m.i, k], m.fields[k]) }
+        else if (m.op == "state") {
+            app.busy = m.busy
+            app.model = m.model
+            app.modelName = m.modelName ?? ""
+            app.canUndo = m.canUndo
+            if (app.rev != 0 && m.rev != app.rev) app.changed = (m.changed ?? []).join(",")   // the portal reopens those apps
+            app.rev = m.rev
+            // a chat switch asked for while the agent was busy happens now
+            if (!m.busy && app.chatOpen && app.chatApp != app.wantApp) app.bind()
+            }
+        if (m.op == "reset") { app.following = true; afterSettle(app.toEnd) }
+        },
+
+    // ── following the conversation ──
+    // The log keeps to its end as it grows (the stack's height changing is
+    // the cue), unless the reader has scrolled up to read; scrolling back
+    // down to the end picks them up again.
+    following: boolean = true,
+    lastY: number = 0,
+    noteScroll() {
+        const log = app.panel.log
+        if (log.scrollY >= log.stack.height + 28 - log.height - 60) app.following = true
+        else if (log.scrollY < app.lastY) app.following = false
+        app.lastY = log.scrollY
+        },
+    toEnd() { app.panel.log.scrollTo(Infinity) },
+
+    // ── the verbs, each one POST ──
+
+    prompter: DataSource [ url = "/api/prompt", method = "POST" ],
+    send(text: string) {
+        if (text.trim() == "" || app.busy) return
+        app.prompter.body = ({ text: text })
+        app.prompter.fetch()
+        app.following = true                   // sending always brings the end back into view
+        afterSettle(app.toEnd)
+        },
+    aborter: DataSource [ url = "/api/abort", method = "POST" ],
+    undoer: DataSource [ url = "/api/undo", method = "POST" ],
+    fresh: DataSource [ url = "/api/newchat", method = "POST" ],
+    opener: DataSource [ url = "/api/chats/open", method = "POST" ],
+    openSaved(id: string) {
+        app.historyOpen = false
+        if (id == app.chatId) return
+        app.opener.body = ({ id: id })
+        app.opener.fetch()
+        },
+    binder: DataSource [ url = "/api/chats/forapp", method = "POST" ],
+    wantApp: string = "",
+    // the chat that goes with where the panel is: the docked app's, or the general one
+    bind() {
+        app.wantApp = app.docked ? app.attachApp : ""
+        if (app.wantApp == app.chatApp) return
+        app.historyOpen = false
+        app.binder.body = ({ app: app.wantApp, title: app.attachTitle })
+        app.binder.fetch()
+        },
+    deleter: DataSource [ url = "/api/chats/delete", method = "POST" ],
+    forget(id: string) {
+        app.deleter.body = ({ id: id })
+        app.deleter.fetch()
+        },
+
+    // ── the panel's place ──
+
+    // the general panel is in the URL, so a reload keeps it; a docked one shows while its window is in front
+    chatOpen: boolean = { app.location == "chat" || (app.docked && !app.coveredWin) },
+    panelT: number = 0,
+    slide: Spring [ attribute = panelT, to = { app.chatOpen ? 1 : 0 }, stiffness = 260, damping = 28, epsilon = 0.001 ],
+    openChat(text: string) {
+        app.attachWin = ""
+        app.location = "chat"
+        app.bind()
+        if (text != "") app.panel.foot.input.text = text
+        afterSettle(app.focusInput)
+        },
+    closePanel() { app.location = ""; app.attachWin = "" },
+
+    // docked beside an app's window (its place, in page coordinates, as the portal last posted it)
+    attachWin: string = "",
+    attachApp: string = "",
+    attachTitle: string = "",
+    ax: number = 0,
+    ay: number = 0,
+    aw: number = 0,
+    ah: number = 0,
+    coveredWin: boolean = false,                 // another window is in front of it: the drawer hides with it
+    docked: boolean = { app.attachWin != "" },
+    // which edge of the window the drawer comes out of: the right if it fits,
+    // else the left; "float" when neither does (a wide window), at the page's edge
+    drawerW: number = 340,
+    side: string = { !app.docked ? "" : app.ax + app.aw + app.drawerW <= app.width ? "right"
+        : app.ax - app.drawerW >= 0 ? "left" : "float" },
+    joined: boolean = { app.side == "right" || app.side == "left" },
+    osDark: boolean = true,                      // the portal's appearance, as the window last posted it
+
+    // ── the panel's colors: dark, except as the drawer of a window in a light portal ──
+    lite: boolean = { app.joined && !app.osDark },
+    cText: Color = { app.lite ? 0x1D1D1F : 0xF2F2F7 },
+    cHead: Color = { app.lite ? 0x1D1D1F : 0xFFFFFF },
+    cBody: Color = { app.lite ? 0x3A3A3C : 0xE5E5EA },
+    cSoft: Color = { app.lite ? 0x48484A : 0xC7C7CC },
+    cMuted: Color = { app.lite ? 0x6E6E73 : 0x98989D },
+    cWash: Color = { app.lite ? 0x0000000A : 0xFFFFFF0D },
+    cWashHi: Color = { app.lite ? 0x00000014 : 0xFFFFFF1F },
+    cRule: Color = { app.lite ? 0x0000001A : 0xFFFFFF1A },
+    cPane: Color = { app.lite ? 0xF5F5F7 : 0x1C1C1E },
+    attach(p: AssistPost) {
+        const first = app.attachWin == "" || app.attachApp != p.app
+        app.attachWin = "" + p.win
+        app.attachApp = "" + p.app
+        app.attachTitle = "" + (p.title ?? p.app)
+        app.ax = p.x ?? 0; app.ay = p.y ?? 0; app.aw = p.w ?? 0; app.ah = p.h ?? 0
+        app.coveredWin = p.covered ?? false
+        app.osDark = p.dark ?? true
+        if (first) { app.location = ""; app.bind(); afterSettle(app.focusInput) }
+        },
+
+    focusInput() { Focus.focus(app.panel.foot.input) },
+
+    keys: Keys [
+        onKeyDown(e: KeyEvent) {
+            if ((e.meta || e.ctrl) && (e.key == "j" || e.key == "J") && !e.repeat) app.openChat("")
+            else if (e.key == "Escape" && app.chatOpen) app.closePanel()
+            }
+        ],
+
+    // ── the portal, filling the page ──
+
+    os: AppIsland [ x = 0, y = 0, width = 100%, height = 100%,
+        // island names resolve from this folder's demos/; mounted once the
+        // bridge has said which revision this is
+        program = { app.rev == 0 ? "" : "../hub/portal" },
+        provides = ["rev", "changed", "session", "assisting", "assistSide"],
+        rev: number = { app.rev },
+        changed: string = { app.changed },
+        session: string = { keptSession() },     // read once, at mount
+        assisting: string = { app.attachWin },   // the window the panel is docked beside
+        assistSide: string = { app.side },       // …and which of its edges ("right" | "left" | "float")
+        onPost(m: IslandPost) {
+            if (m.topic == "assistant") app.openChat("" + ((m.payload as { text?: string })?.text ?? ""))
+            else if (m.topic == "assist") {
+                const p = m.payload as AssistPost
+                if (p.close == true) { if (app.docked) app.closePanel() }
+                else app.attach(p)
+                }
+            else if (m.topic == "session") keepSession(JSON.stringify(m.payload))
+            }
+        ],
+
+    // ── the assistant panel ──
+
+    // Docked beside an app window it is that window's drawer: flush against
+    // its edge (the joined corners square, here and on the window), the
+    // window's height, its header the title bar's height so their rules
+    // line up, sliding out of the edge as it opens.
+    panel: View [ width = { app.docked ? app.drawerW : 420 },
+        headH: number = { app.joined ? 35 : 48 },
+        height = { app.joined ? Math.max(app.ah, 280) : app.docked ? Math.min(app.height - 76, Math.max(app.ah, 460)) : app.height - 76 },
+        y = { app.joined ? app.ay : app.docked ? Math.max(64, Math.min(app.ay, app.height - this.height - 12)) : 64 },
+        x = { app.side == "right" ? app.ax + app.aw - (1 - app.panelT) * 14
+            : app.side == "left" ? app.ax - this.width + (1 - app.panelT) * 14
+            : app.docked ? app.width - this.width - 8
+            : app.width - (this.width + 12) * app.panelT },
+        visible = { app.chatOpen || app.panelT > 0.001 },
+        opacity = { Math.min(1, app.panelT * 1.6) },
+        cornerRadius = { app.side == "right" ? [0, 10, 10, 0] : app.side == "left" ? [10, 0, 0, 10] : [16, 16, 16, 16] }, clip = true,
+        theme = { app.lite ? Cupertino : CupertinoDark },
+        fill = { app.lite ? 0xF5F5F7 : app.joined ? 0x1E1E20 : 0x1C1C1EE0 }, backdrop = frost(24, 1.4),
+        stroke = { stroke(1, app.lite ? 0x00000026 : app.joined ? 0xFFFFFF14 : 0xFFFFFF1F) },
+        shadow = { app.joined ? shadow(0, 12, 26, 0x0000006B) : shadow(0, 18, 50, 0x00000080) },
+
+        head: View [ x = 0, y = 0, width = 100%, height = { parent.headH },
+            fill = { app.lite ? gradient(0xFAFAFC, 0xE6E6EA) : app.joined ? gradient(0x3B3B40, 0x2E2E32) : 0x00000000 },
+            badge: View [ x = { app.joined ? 10 : 14 }, y = center, width = { app.joined ? 20 : 26 }, height = { this.width },
+                cornerRadius = { app.joined ? 5 : 7 },
+                fill = { gradient(0x7B5CFF, 0x3A1FB8) },
+                Text [ x = center, y = center, fontSize = { app.joined ? 11 : 14 }, textColor = #FFFFFF, text = "✦" ] ],
+            title: Text [ x = { app.joined ? 38 : 48 }, y = { app.joined ? (parent.height - this.height) / 2 : 7 },
+                fontSize = { app.joined ? 13 : 14 }, fontWeight = semibold, textColor = { app.cHead },
+                wrap = false, clip = true, width = { Math.min(this.contentWidth, parent.tools.x - this.x - 22) },
+                text = { app.joined ? "Assistant" : app.chatApp != "" ? app.chatAppTitle : "Assistant" } ],
+            dot: View [ x = { app.joined ? parent.title.x + parent.title.width + 7 : 48 }, y = { app.joined ? (parent.height - 7) / 2 : 30 },
+                width = 7, height = 7, cornerRadius = 3.5,
+                tooltipLabel = { parent.status.text },
+                fill = { !app.connected ? 0xFF453A : app.busy ? 0xFFD60A : app.model == "ready" ? 0x30D158 : app.model == "offline" ? 0xFF453A : app.model == "asleep" ? 0x8E8E93 : 0xFF9F0A } ],
+            status: Text [ visible = { !app.joined }, x = 60, y = 26, fontSize = 11, textColor = { app.cMuted },
+                wrap = false, clip = true, width = { Math.min(this.contentWidth, parent.tools.x - this.x - 8) },
+                text = { !app.connected ? "Connecting to the bridge…"
+                    : app.busy ? (app.model == "loading" ? "Waking the model (1–3 min)…" : "Working…")
+                    : app.model == "ready" ? (app.docked ? "Ready" : "Ready · " + app.modelName)
+                    : app.model == "offline" ? "Model offline — start Strata"
+                    : app.model == "asleep" ? "Model asleep — wakes on your first prompt (1–3 min)"
+                    : "Model loading…" } ],
+            tools: View [ x = { parent.width - this.width - 10 }, y = center,
+                layout: SimpleLayout [ axis = x, spacing = 2, align = center ],
+                HeadButton [ label = "Undo", tooltipLabel = "Revert the last change (on GitHub too)",
+                    disabled = { !app.canUndo || app.busy }, act() { app.undoer.fetch() } ],
+                HeadButton [ label = { app.historyOpen ? "Back" : "History" }, tooltipLabel = "Your earlier chats",
+                    disabled = { app.busy && !app.historyOpen }, act() { app.historyOpen = !app.historyOpen } ],
+                HeadButton [ label = "New chat", tooltipLabel = "Start a fresh conversation",
+                    disabled = { app.busy }, act() { app.historyOpen = false; app.fresh.fetch() } ],
+                HeadButton [ label = "✕", act() { app.closePanel() } ]
+                ]
+            ],
+        rule: View [ x = 0, y = { parent.headH - 1 }, width = 100%, height = 1, fill = { app.cRule } ],
+
+        // the conversation — read from the bottom, so it follows new text
+        // while the reader is at the end and holds still when they scroll up
+        log: View [ x = 0, y = { parent.headH }, width = 100%, height = { parent.height - parent.headH - 64 },
+            scrolls = y, scrollAnchor = none, padding = [14, 16, 14, 16],
+            trackChanges = ["scrollY"],
+            onChange() { app.noteScroll() },
+            stack: View [ width = 100%, datapath = { app.chat.value },
+                trackChanges = ["height"],
+                onChange() { if (app.following) app.toEnd() },
+                layout: SimpleLayout [ axis = y, spacing = 10 ],
+                Block [ datapath = :blocks[], key = :id,
+                    classFor = { :kind == "user" ? UserBlock : :kind == "assistant" ? AssistantBlock
+                        : :kind == "thinking" ? ThinkingBlock : :kind == "tool" ? ToolBlock : SystemBlock } ]
+                ]
+            ],
+
+        // the saved chats, over the conversation while open
+        history: View [ visible = { app.historyOpen }, x = 0, y = { parent.headH }, width = 100%, height = { parent.height - parent.headH },
+            fill = { app.cPane }, scrolls = y, padding = [12, 12, 12, 12],
+            datapath = { app.chats.value },
+            layout: SimpleLayout [ axis = y, spacing = 6 ],
+            Text [ fontSize = 11, fontWeight = semibold, textColor = #8E8E93, text = "CHATS" ],
+            Text [ visible = { (app.chats.value?.chats ?? []).length == 0 }, fontSize = 13, textColor = { app.cMuted },
+                text = "No saved chats yet." ],
+            ChatRow [ datapath = :chats[], key = :id ]
+            ],
+
+        // shown while there is no conversation yet
+        hello: View [ visible = { app.empty && !app.historyOpen && app.chatApp == "" }, x = 16, y = 70, width = { parent.width - 32 },
+            layout: SimpleLayout [ axis = y, spacing = 8 ],
+            Text [ width = 100%, wrap = true, fontSize = 13, textColor = { app.cSoft },
+                text = "Ask for a new app — it gets its own GitHub repo — or for a change to one of yours. To change just one app, use the ✦ on its window." ],
+            View [ width = 4, height = 6 ],
+            Suggestion [ label = "Make me a pomodoro timer app" ],
+            Suggestion [ label = "Make me a habit tracker with a streak count" ],
+            Suggestion [ label = "Make me a markdown notes app" ]
+            ],
+        // …and on an app's own chat
+        helloApp: View [ visible = { app.empty && !app.historyOpen && app.chatApp != "" }, x = 16, y = { parent.headH + 20 }, width = { parent.width - 32 },
+            layout: SimpleLayout [ axis = y, spacing = 8 ],
+            Text [ width = 100%, wrap = true, fontSize = 13, textColor = { app.cSoft },
+                text = { "Ask for a change to " + app.chatAppTitle + " — how it looks or what it does. Changes in this chat stay inside this app, and go to your copy of it on GitHub (a fork, if it isn't yours)." } ],
+            View [ width = 4, height = 6 ],
+            Suggestion [ label = "Fix anything that looks wrong" ],
+            Suggestion [ label = "Make it look more polished" ],
+            Suggestion [ label = "Make the text bigger" ]
+            ],
+
+        foot: View [ x = 0, y = { parent.height - 64 }, width = 100%, height = 64,
+            Rule: View [ x = 0, y = 0, width = 100%, height = 1, fill = { app.cRule } ],
+            input: TextInput [ x = 14, y = 14, width = { parent.width - 28 - 76 }, height = 36,
+                textColor = { app.cText },
+                placeholder = { app.busy ? "Working — wait, or Stop" : app.chatApp != "" ? "Ask for a change to " + app.chatAppTitle + "…" : "Ask for a new app or a change…" },
+                onEnter() { if (!app.busy && this.text.trim() != "") { app.send(this.text); this.text = "" } } ],
+            go: Button [ x = { parent.width - 14 - 68 }, y = 18, width = 68,
+                label = { app.busy ? "Stop" : "Send" }, primary = { !app.busy },
+                onClick() {
+                    if (app.busy) app.aborter.fetch()
+                    else { const t = app.panel.foot.input.text; if (t.trim() != "") { app.send(t); app.panel.foot.input.text = "" } }
+                    } ]
+            ]
+        ]
+    ]

@@ -1,0 +1,363 @@
+/*
+# The hub's model — apps, windows, launching
+
+Faceless nodes only: nothing in this file draws. The portal's views
+(portal.declare, system/windows.declare, system/github.declare) bind to what
+lives here.
+
+- **Apps are records**, read from the bridge (`/api/hub`): the registry —
+  each app a GitHub repo pinned to a commit — joined with each app's own
+  `declare-app.json` (title, icon, window size).
+- **Windows are records** too (`WinManager.list`): one per open window, in
+  paint order. A raise is a `move`, an open an `insert`, a close a
+  `removeAt`; the portal replicates one Window view per record.
+- **The Launcher** turns an app record into a window, and opens the GitHub
+  windows: an app's forks, a fork's preview, and Explore.
+*/
+
+// an app as the bridge reports it — every field the portal reads; extra keys pass
+schema AppRec [
+    id: string,
+    label: string,                           // the tile's short name
+    title: string,                           // the formal name
+    program: string,                         // its program, from the hub's root ("apps/dice/dice")
+    glyph?: string,                          // the icon's mark — an emoji or a few letters
+    hue1?: string,                           // the icon plate's gradient, top → bottom ("#RRGGBB")
+    hue2?: string,
+    ink?: string,                            // the glyph's color (default white)
+    blurb?: string,                          // one line about it
+    width?: number,                          // the window's opening size
+    height?: number,
+    repo: string,                            // "owner/name" on GitHub ("local/<id>" before it is published)
+    owner: string,
+    ref: string,                             // the commit the hub runs
+    mine: boolean,                           // in a repo of yours
+    pending: boolean                         // changed here, not on GitHub yet
+    ]
+schema Me [ login: string, name: string, avatar: string ]
+
+script {
+    // the shell's saved session (JSON) → its window list ([] when unreadable)
+    function parseWins(s: string): object[] {
+        try { return (JSON.parse(s) as { wins?: object[] }).wins ?? [] } catch (e) { return [] }
+    }
+
+    // "#RRGGBB" → a Color number; a bad or missing value falls to `dflt`
+    function hex(s: string | undefined, dflt: number): number {
+        if (s == null || s.length < 7 || s[0] != "#") return dflt
+        const n = parseInt(s.slice(1, 7), 16)
+        return isNaN(n) ? dflt : n
+    }
+}
+
+
+/*
+## WinManager — the set of windows, as data
+
+Who is front. Each record is { id, cls, appId, props… }; record order is
+paint order.
+*/
+
+class WinManager extends Node [
+    frontId: string = "",
+    frontWin: Window = { this.winOf(this.frontId) },
+
+    idSeq: number = 0,                           // mints record identity
+    winCount: number = 0,                        // staggers spawn positions
+
+    list: Dataset { { "wins": [] } },
+
+    recs() -> array { return (this.list.read(["wins"]) as object[]) ?? [] },
+    activeAppId: string = { app.wm.frontWin != null ? app.wm.frontWin.appId : "" },
+
+    // ── the live windows (order = record order) ──
+
+    windows() -> Window[] { return app.wins.childViews as Window[] },
+    winOf(id: string) -> Window { return this.windows().find((w) => w.recId == id) ?? null },
+    idxOf(id: string) -> number { return this.recs().findIndex((r) => r.id == id) },
+
+    // ── the record verbs ──
+
+    spawn() -> number { winCount = winCount + 1; return winCount },
+    mintId() -> string { idSeq = idSeq + 1; return "w" + idSeq },
+
+    // `vid` keys the record's view: a new one rebuilds the window (see refreshApps)
+    addWin(rec: object) { this.list.insert(["wins"], this.recs().length, ({ ...rec, vid: rec.id + "/0" })) },
+
+    focusNew(id: string) { this.frontId = id; this.saveSoon() },
+
+    // a raise is a move to the top
+    raiseWin(w: Window) {
+        if (w == null || w.recId == "") return
+        const ws = this.recs()
+        const from = ws.findIndex((r) => r.id == w.recId)
+        if (from >= 0 && from != ws.length - 1) this.list.move(["wins"], from, ws.length - 1)
+        },
+    patchWin(id: string, p: object) {
+        const i = this.idxOf(id)
+        if (i < 0) return
+        const ws = this.recs()
+        this.list.set(["wins", i], ({ ...(ws[i] as object), ...(p as object) }))
+        },
+    removeWin(id: string) {
+        const i = this.idxOf(id)
+        if (i >= 0) this.list.removeAt(["wins"], i)
+        this.saveSoon()
+        },
+
+    // ── the session: the open windows, as the shell keeps them across a reload ──
+
+    saving: boolean = false,
+    saveSoon() {
+        if (saving) return
+        saving = true
+        afterDelay(400, () => { saving = false; this.saveSession() })
+        },
+    snapshot() -> object[] {
+        const out = [] as object[]
+        for (const r of this.recs()) {
+            if (r.cls != "AppWindow") continue       // the GitHub windows and previews are of the moment
+            const w = this.winOf(r.id)
+            if (w == null || w.closing) continue
+            out.push(({ cls: r.cls, appId: r.appId, front: r.id == this.frontId,
+                props: ({ ...(r.props as object), wx: w.wx, wy: w.wy, width: w.width, height: w.height, bornX: -1, bornY: -1 }) }))
+            }
+        return out
+        },
+    saveSession() { app.post("session", ({ wins: this.snapshot() })) },
+
+    restoreSession(wins: object[]) {
+        for (const s of wins) {
+            const id = this.mintId()
+            this.spawn()
+            if (app.launcher.byId("" + s.appId) == null) continue      // no longer in the hub
+            this.addWin(({ id: id, cls: s.cls, appId: s.appId, props: ({ ...(s.props as object), rev: app.rev }) }))
+            app.launcher.setRunning("" + s.appId, true)
+            if (s.front == true) this.frontId = id
+            }
+        this.saveSoon()
+        },
+
+    // an app that changed (the agent, a fork chosen): each of its windows
+    // loads the new program where it stands. An island never remounts once
+    // wired, so the window is rebuilt: its record keeps its identity (and so
+    // its place in the stack, and an attached chat) but gets a new `vid`,
+    // the view's key, so a fresh window view replaces the old
+    // one. A window whose app left the hub closes.
+    refreshApps(ids: string[]) {
+        for (const r of this.recs()) {
+            if (r.cls != "AppWindow") continue
+            const w = this.winOf(r.id)
+            if (w == null || w.closing) continue
+            const a = app.launcher.byId("" + r.appId)
+            if (a == null) { this.closeWin(w); continue }
+            if (!ids.includes("" + r.appId)) continue
+            this.patchWin(r.id, ({ vid: r.id + "/" + app.rev, props: ({ ...(r.props as object), program: a.program, rev: app.rev,
+                wx: w.wx, wy: w.wy, width: w.width, height: w.height, bornX: -1, bornY: -1 }) }))
+            // an attached chat stays with the rebuilt window
+            if (r.id == app.assisting) app.post("assist", ({ win: r.id, app: r.appId, title: w.title, x: w.wx, y: w.wy + app.headerH, w: w.width, h: w.height }))
+            }
+        this.saveSoon()
+        },
+
+    focusWin(w: Window?) { if (w != null) w.activate() },
+
+    // Quit closes every window of that app and clears its running flag
+    quitApp(id: string) {
+        const doomed = this.windows().filter((w) => w.appId == id)
+        for (const w of doomed) this.closeWin(w)
+        app.launcher.setRunning(id, false)
+        },
+
+    // a tile press: raise the app's window, else open one
+    tileOpen(id: string, open: () -> void) {
+        const live = this.windows().filter((w) => w.appId == id && w.cls == "AppWindow" && !w.closing)
+        if (live.length > 0) { for (const w of live) this.focusWin(w); return }
+        open()
+        },
+    // a window of one kind for one app (its forks list): raise it if open
+    findWin(cls: string, appId: string) -> Window {
+        return this.windows().find((w) => w.cls == cls && w.appId == appId && !w.closing) ?? null
+        },
+
+    closeWin(w: Window) { w.beginClose() },              // the reverse zoom; removal on its onStop
+
+    reallyClose(w: Window) {
+        if (w.recId == app.assisting) app.post("assist", ({ close: true }))
+        if (frontId == w.recId) frontId = ""
+        this.removeWin(w.recId)
+        if (w.cls == "AppWindow" && this.windows().filter((x) => x.appId == w.appId && x.cls == "AppWindow" && x != w).length == 0) app.launcher.setRunning(w.appId, false)
+        }
+    ]
+
+
+/*
+## Launcher — getting apps open
+
+The hub's apps (from the bridge), which are running, and the open verbs
+behind every tile — plus the GitHub windows.
+*/
+
+class Launcher extends Node [
+
+    // the registry, as the bridge reports it; `rev` refetches it whenever an
+    // app changes (the agent, a fork chosen, an app added)
+    hub: DataSource [ auto = true, schema = [ apps[]: AppRec, signedIn: boolean ],
+        url = { "/api/hub?rev=" + hostProvided("rev", 0) } ],
+    apps: AppRec[] = { this.hub.value?.apps ?? [] },
+    me: Me? = { (this.hub.value as { me?: Me })?.me ?? null },
+    loaded: boolean = { this.hub.value != null },
+
+    byId(id: string) -> AppRec { return this.apps.find((a) => a.id == id) ?? null },
+    titleOf(id: string) -> string { const a = this.byId(id); return a != null ? a.title : "" },
+
+    running: string[] = [],
+    setRunning(id: string, on: boolean) {
+        const rest = this.running.filter((r) => r != id)
+        this.running = on ? [...rest, id] : rest
+        },
+
+    // the origin view is a side channel: a node reference never enters data
+    borns: object,
+    onInit() { this.borns = ({}) },
+    putBorn(id: string, v: View?) { if (v != null && this.borns != null) this.borns[id] = v },
+    takeBorn(id: string) -> View {
+        if (this.borns == null) return null
+        const v = this.borns[id] ?? null
+        delete this.borns[id]
+        return v as View
+        },
+
+    openWin(id: string, cls: string, appId: string, props: object, v: View?) {
+        this.putBorn(id, v)
+        app.wm.addWin(({ id: id, cls: cls, appId: appId, props: props }))
+        app.wm.focusNew(id)
+        },
+
+    // a view's center in app coordinates, scroll offsets included
+    originOf(v: View?) -> object {
+        if (v == null) return null
+        let ox = v.width / 2
+        let oy = v.height / 2
+        let n = v
+        while (n != null) {
+            ox += n.x || 0
+            oy += n.y || 0
+            const p = n.parent
+            if (p != null) { ox -= p.scrollX || 0; oy -= p.scrollY || 0 }
+            n = p
+            }
+        return ({ x: ox, y: oy })
+        },
+
+    // where a new window of this size goes: staggered, inside the page
+    spot(ww: number, wh: number) -> object {
+        const n = app.wm.spawn()
+        return ({ wx: Math.max(10, Math.round((app.width - ww) / 2) - 140 + (n % 6) * 36),
+            wy: Math.max(8, Math.min(app.height - app.headerH - wh - 8, 20 + (n % 6) * 24)) })
+        },
+
+    launch(id: string, v: View?) {
+        const a = this.byId(id)
+        if (a == null || a.program == "") return
+        app.wm.tileOpen(id, () => this.openProgram(a, v))
+        },
+
+    openProgram(a: AppRec, v: View?) {
+        const ww = Math.min(a.width ?? 640, app.width - 40)
+        const wh = Math.min(a.height ?? 460, app.height - app.headerH - 20)
+        const at = this.spot(ww, wh)
+        const o = this.originOf(v)
+        this.setRunning(a.id, true)
+        this.openWin(app.wm.mintId(), "AppWindow", a.id,
+            ({ program: a.program, rev: app.rev, width: ww, height: wh, wx: at.wx, wy: at.wy,
+                bornX: o != null ? o.x - at.wx : -1, bornY: o != null ? o.y - at.wy - app.headerH : -1 }), v)
+        },
+
+    // ── GitHub ──
+
+    // an app's forks: beside its window if it has one
+    openForks(id: string, v: View?) {
+        const open = app.wm.findWin("ForksWindow", id)
+        if (open != null) { open.activate(); return }
+        const w = app.wm.findWin("AppWindow", id)
+        const ww = 420
+        const wh = Math.min(560, app.height - app.headerH - 20)
+        let at = this.spot(ww, wh)
+        if (w != null) {
+            const right = w.wx + w.width + 16
+            at = ({ wx: right + ww <= app.width ? right : Math.max(10, w.wx - ww - 16), wy: w.wy })
+            }
+        this.openWin(app.wm.mintId(), "ForksWindow", id, ({ width: ww, height: wh, wx: at.wx, wy: at.wy }), v)
+        },
+
+    // a fork to try: fetched by the bridge, then opened in a PreviewWindow
+    previewer: DataSource [ url = "/api/preview", method = "POST",
+        onLoad() {
+            const r = this.value as { ok: boolean, program?: string, sha?: string, error?: string, width?: number, height?: number }
+            const ask = classroot.asked
+            if (r == null || !r.ok || ask == null) { classroot.problem = r?.error ?? "Couldn't fetch that version"; return }
+            classroot.problem = ""
+            const a = classroot.byId(ask.id)
+            const ww = Math.min(r.width ?? a?.width ?? 480, app.width - 40)
+            const wh = Math.min((r.height ?? a?.height ?? 420) + 40, app.height - app.headerH - 20)
+            const at = classroot.spot(ww, wh)
+            classroot.openWin(app.wm.mintId(), "PreviewWindow", ask.id,
+                ({ program: r.program, rev: app.rev, repo: ask.repo, sha: r.sha ?? "", note: ask.note, width: ww, height: wh, wx: at.wx, wy: at.wy }), null)
+            }
+        ],
+    asked: object = null,
+    problem: string = "",
+    // ref: the fork's commit, or its branch when GitHub couldn't compare it
+    preview(id: string, repo: string, ref: string, note: string) {
+        this.asked = ({ id: id, repo: repo, note: note })
+        this.previewer.body = ({ repo: repo, ref: ref })
+        this.previewer.fetch()
+        },
+
+    // choose a fork: the bridge moves the app and the registry, then bumps
+    // the revision, which reopens the app's windows on it
+    user: DataSource [ url = "/api/use", method = "POST",
+        onLoad() {
+            const r = this.value as { ok: boolean, error?: string }
+            classroot.problem = r != null && !r.ok ? (r.error ?? "") : ""
+            }
+        ],
+    useFork(id: string, repo: string, sha: string, from: Window?) {
+        this.user.body = ({ id: id, repo: repo, sha: sha })
+        this.user.fetch()
+        if (from != null && from.cls == "PreviewWindow") app.wm.closeWin(from)
+        },
+
+    publisher: DataSource [ url = "/api/publish", method = "POST",
+        onLoad() {
+            const r = this.value as { ok: boolean, error?: string }
+            classroot.problem = r != null && !r.ok ? (r.error ?? "") : ""
+            }
+        ],
+    publish(id: string) { this.publisher.body = ({ id: id }); this.publisher.fetch() },
+
+    adder: DataSource [ url = "/api/add", method = "POST",
+        onLoad() {
+            const r = this.value as { ok: boolean, error?: string }
+            classroot.problem = r != null && !r.ok ? (r.error ?? "") : ""
+            }
+        ],
+    remover: DataSource [ url = "/api/remove", method = "POST",
+        onLoad() {
+            const r = this.value as { ok: boolean, error?: string }
+            classroot.problem = r != null && !r.ok ? (r.error ?? "") : ""
+            }
+        ],
+    removeApp(id: string) { this.problem = ""; this.remover.body = ({ id: id }); this.remover.fetch() },
+        addApp(repo: string) { this.problem = ""; this.adder.body = ({ repo: repo }); this.adder.fetch() },
+
+    openExplore() {
+        const open = app.wm.windows().find((w) => w.cls == "ExploreWindow" && !w.closing) ?? null
+        if (open != null) { open.activate(); return }
+        const ww = Math.min(560, app.width - 40)
+        const wh = Math.min(600, app.height - app.headerH - 20)
+        const at = this.spot(ww, wh)
+        this.openWin(app.wm.mintId(), "ExploreWindow", "", ({ width: ww, height: wh, wx: at.wx, wy: at.wy }), null)
+        }
+    ]

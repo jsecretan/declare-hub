@@ -1,0 +1,238 @@
+/*
+# Declare Hub — the portal
+
+The page you use: a header, your apps laid out as tiles, and the windows they
+open in. Two faceless nodes carry the model — `wm` (the windows, as records)
+and `launcher` (the apps, from the bridge's registry) — and the views stack
+in paint order: wallpaper, header, tiles, windows.
+
+- The model: system/model.declare
+- Window chrome, app windows and previews: system/windows.declare
+- The forks and Explore windows: system/github.declare
+- The apps themselves: apps/<id>/, each a checkout of its GitHub repo
+
+This portal runs inside a host shell that owns the assistant panel. It asks
+for it with `app.askAssistant(text)`; the shell provides `rev` (bumped
+whenever an app changes) and `changed` (which ones).
+*/
+
+include [ "system/model.declare", "system/windows.declare", "system/github.declare" ]
+
+
+/*
+## Wallpaper — a generative mesh field, drawn
+
+A dark hue-tinted ground with five saturated color poles melted together
+under a blur. A pure function of `seed`; drawn once at a fixed reference
+size and cover-scaled, so it never re-rasters on resize.
+*/
+
+class Wallpaper [
+    seed: number = 7,
+    refW: number = 1920,
+    refH: number = 1200,
+    width = { this.refW }, height = { this.refH },
+    x = center, y = center,
+    pivotX = { this.refW / 2 }, pivotY = { this.refH / 2 },
+    scale = { Math.max(app.width / this.refW, app.height / this.refH) },
+    draw(d: Draw) {
+        const W = this.width
+        const H = this.height
+        const hsl = (h, s, l) => "hsl(" + (((h % 360) + 360) % 360) + "," + s + "%," + l + "%)"
+        let a = (this.seed >>> 0) || 1
+        const rnd = () => {
+            a = (a + 1831565813) | 0
+            let t = Math.imul(a ^ (a >>> 15), 1 | a)
+            t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+            }
+        const hue0 = rnd() * 360
+        const scheme = Math.floor(rnd() * 3)
+        const hueFor = () => {
+            if (scheme == 0) return hue0 + (rnd() - 0.5) * 100
+            if (scheme == 1) return hue0 + [0, 120, 240][Math.floor(rnd() * 3)] + (rnd() - 0.5) * 26
+            return rnd() < 0.72 ? hue0 + (rnd() - 0.5) * 74 : hue0 + 180 + (rnd() - 0.5) * 40
+            }
+        d.fillStyle = hsl(hue0, 52, 5)
+        d.fillRect(0, 0, W, H)
+        const spots = [[0.17, 0.24], [0.82, 0.2], [0.5, 0.54], [0.2, 0.82], [0.83, 0.8]]
+        const blurPx = Math.round(Math.max(W, H) * 0.05)
+        d.save()
+        d.filter = "blur(" + blurPx + "px)"
+        d.globalCompositeOperation = "lighten"
+        for (const s of spots) {
+            const px = (s[0] + (rnd() - 0.5) * 0.18) * W
+            const py = (s[1] + (rnd() - 0.5) * 0.18) * H
+            const r = (0.36 + rnd() * 0.26) * Math.max(W, H)
+            const h = hueFor()
+            const sat = 70 + rnd() * 22
+            const li = 44 + rnd() * 12
+            const g = d.createRadialGradient(px, py, 0, px, py, r)
+            g.addColorStop(0, hsl(h, sat, li))
+            g.addColorStop(0.5, hsl(h, sat, li * 0.62))
+            g.addColorStop(1, "rgba(0,0,0,0)")
+            d.fillStyle = g
+            d.fillRect(0, 0, W, H)
+            }
+        d.restore()
+        const v = d.createRadialGradient(W / 2, H * 0.45, H * 0.1, W / 2, H * 0.5, W * 0.72)
+        v.addColorStop(0, "rgba(0,0,0,0)")
+        v.addColorStop(1, "rgba(0,0,6,0.62)")
+        d.fillStyle = v
+        d.fillRect(0, 0, W, H)
+        const top = d.createLinearGradient(0, 0, 0, 48)
+        top.addColorStop(0, "rgba(0,0,0,0.30)")
+        top.addColorStop(1, "rgba(0,0,0,0)")
+        d.fillStyle = top
+        d.fillRect(0, 0, W, 48)
+        }
+    ]
+
+
+App [ appName = "Declare Hub", scrolls = none,
+    wm: WinManager [ ],
+    launcher: Launcher [ ],
+    minWidth = 640, minHeight = 480,
+    theme = { app.darkMode ? CupertinoDark : Cupertino },
+    fontFamily = "system-ui, sans-serif",
+    fill = 0x0A0612,
+
+    headerH: number = 56,                        // windows live below the header
+
+    // ── what the host shell provides ──
+
+    rev: number = { hostProvided("rev", 0) },        // bumped whenever an app changes
+    changedApps: string = { hostProvided("changed", "") },   // …and which ones, comma-separated
+    session: string = { hostProvided("session", "") },       // the windows open before the page last reloaded (JSON)
+    assisting: string = { hostProvided("assisting", "") },   // the window whose ✦ chat is open beside it (its record id)
+    assistSide: string = { hostProvided("assistSide", "") }, // the edge that chat is joined to: "right" | "left" | "float"
+
+    // A program's island name. Island names resolve from the page's demos/
+    // folder, hence "../"; the revision segment (the rev the window opened
+    // at) makes a changed app a new name, so it is fetched fresh.
+    programPath(p: string, r: number) -> string { return p == "" ? "" : "../r" + r + "/../" + p },
+
+    // a change reopens the changed apps' windows in place, on the new code
+    revWatch: Node [ seen: number = { app.rev }, trackChanges = ["seen"],
+        onChange() { afterDelay(300, () => app.wm.refreshApps(app.changedApps.split(",").filter((s) => s != ""))) } ],
+
+    askAssistant(text: string) { app.post("assistant", ({ text: text })) },
+
+    darkLocked: boolean = false,
+    darkChoice: boolean = false,
+    darkMode: boolean = { this.darkLocked ? this.darkChoice : app.dark },
+
+    // the windows that were open before a reload come back, once the apps are known
+    restored: boolean = false,
+    restoreWatch: Node [ ready: boolean = { app.launcher.loaded }, trackChanges = ["ready"],
+        onChange() { if (this.ready && !app.restored) { app.restored = true; if (app.session != "") app.wm.restoreSession(parseWins(app.session)) } } ],
+
+    wallpaper: Wallpaper [ ],
+
+    // ── the header: name, search, Explore, the assistant, who you are ──
+
+    header: View [ x = 0, y = 0, width = { app.width }, height = { app.headerH },
+        fill = { app.darkMode ? 0x14121CD9 : 0xFFFFFFCC }, backdrop = frost(20, 1.3),
+        stroke = { stroke(1, app.darkMode ? 0xFFFFFF14 : 0x0000001A) },
+        logo: View [ x = 18, y = center, width = 30, height = 30, cornerRadius = 8, fill = { gradient(0x7B5CFF, 0x3A1FB8) },
+            Text [ x = center, y = center, fontSize = 16, textColor = #FFFFFF, text = "✦" ] ],
+        name: Text [ x = 58, y = center, fontSize = 17, fontWeight = bold, textColor = { provided("theme").text }, text = "Declare Hub" ],
+        search: TextInput [ x = 200, y = center, width = { Math.max(140, Math.min(300, parent.width - 200 - parent.right.width - 40)) }, height = 34,
+            visible = { parent.width > 700 },
+            placeholder = "Filter your apps",
+            onInput() { app.query = this.text } ],
+        right: View [ x = { parent.width - this.width - 16 }, y = center,
+            layout: SimpleLayout [ axis = x, spacing = 10, align = center ],
+            Button [ label = "Explore", onClick() { app.launcher.openExplore() } ],
+            Button [ label = "✦ Assistant", primary = true, onClick() { app.askAssistant("") } ],
+            who: View [ height = 32, cornerRadius = 16, padding = [0, 12, 0, 4],
+                fill = { app.darkMode ? 0xFFFFFF14 : 0x0000000D },
+                tooltipLabel = { app.launcher.me != null ? "Signed in to GitHub as " + app.launcher.me.login
+                    : "Not signed in to GitHub: apps run, but your changes stay on this computer. See the README." },
+                layout: SimpleLayout [ axis = x, spacing = 8, align = center ],
+                View [ width = 24, height = 24, cornerRadius = 12,
+                    fill = { app.launcher.me != null ? 0x2DA44E : 0x8E8E93 },
+                    Text [ x = center, y = center, fontSize = 12, fontWeight = bold, textColor = #FFFFFF,
+                        text = { app.launcher.me != null ? app.launcher.me.login.slice(0, 1).toUpperCase() : "?" } ] ],
+                Text [ fontSize = 12.5, textColor = { provided("theme").text },
+                    text = { app.launcher.me != null ? app.launcher.me.login : "Not signed in" } ]
+                ]
+            ]
+        ],
+
+    // ── the apps, laid out across the page ──
+
+    query: string = "",
+    shown: AppRec[] = { app.launcher.apps.filter((a) => app.query == "" || (a.title + " " + a.repo).toLowerCase().includes(app.query.toLowerCase())) },
+    tileData: Dataset [ contents = { { apps: app.shown.map((a) => ({ id: a.id })) } } ],
+
+    page: View [ x = 0, y = { app.headerH }, width = { app.width }, height = { app.height - app.headerH }, scrolls = y,
+        padding = [36, 48, 36, 48],
+        col: View [ width = 100%,
+            layout: SimpleLayout [ axis = y, spacing = 18 ],
+            Text [ fontSize = 13, fontWeight = semibold, textColor = #FFFFFFB3, text = "YOUR APPS" ],
+            grid: View [ width = 100%, datapath = { app.tileData.value },
+                layout: WrappingLayout [ spacing = 22, rowSpacing = 22 ],
+                AppTile [ datapath = :apps[], key = :id ],
+                NewTile [ ]
+                ],
+            Text [ visible = { app.launcher.loaded && app.launcher.apps.length == 0 }, fontSize = 14, textColor = #FFFFFFCC,
+                text = "No apps yet. Ask the assistant for one, or add some from Explore." ]
+            ]
+        ],
+
+    // ── the windows layer: one Window per record, built as the class the
+    // record names; record order is paint order ──
+
+    wins: View [ x = 0, y = { app.headerH }, width = { app.width }, height = { app.height - app.headerH },
+        datapath = { app.wm.list.value },
+        Window [ datapath = :wins[], key = :vid,
+            classFor = { :cls == "AppWindow" ? AppWindow : :cls == "PreviewWindow" ? PreviewWindow
+                : :cls == "ForksWindow" ? ForksWindow : :cls == "ExploreWindow" ? ExploreWindow : Window } ]
+        ]
+    ]
+
+
+/*
+## AppTile — an app on the page
+
+Its icon, its name, and whose repo it runs from. Press it to open the app;
+⑂ (on hover) lists its other versions.
+*/
+
+class AppTile extends Control [ width = 150, height = 156, cornerRadius = 18,
+    appId: string = { "" + (:id ?? "") },
+    running: boolean = { app.launcher.running.includes(this.appId) },
+    rec: AppRec? = { app.launcher.byId(this.appId) },
+    fill = { this.hovered ? 0xFFFFFF1F : 0xFFFFFF00 },
+    tooltipLabel = { this.rec?.blurb ?? "" },
+    press() { app.launcher.launch(this.appId, this.icon) },
+
+    icon: AppGlyph [ x = center, y = 16, edge = 76, appId = { classroot.appId },
+        shadow = { shadow(0, 6, 16, 0x00000066) } ],
+    nm: Text [ x = center, y = 100, fontSize = 14, fontWeight = semibold, textColor = #FFFFFF,
+        wrap = false, clip = true, width = { Math.min(this.contentWidth, parent.width - 12) },
+        text = { classroot.rec?.label ?? classroot.appId } ],
+    by: Text [ x = center, y = 120, fontSize = 11.5, textColor = #FFFFFFA6,
+        wrap = false, clip = true, width = { Math.min(this.contentWidth, parent.width - 12) },
+        text = { classroot.rec == null ? "" : classroot.rec.pending ? "changed here · not on GitHub"
+            : classroot.rec.repo.startsWith("local/") ? "on this computer" : classroot.rec.mine ? "yours" : "by " + classroot.rec.owner } ],
+    dot: View [ visible = { classroot.running }, x = center, y = 140, width = 5, height = 5, cornerRadius = 2.5, fill = #FFFFFF ],
+    pend: View [ visible = { classroot.rec != null && classroot.rec.pending }, x = { parent.width - 30 }, y = 10,
+        width = 10, height = 10, cornerRadius = 5, fill = #FF9F0A, tooltipLabel = "Changed here and not on GitHub yet" ],
+    fk: View [ visible = { classroot.hovered }, x = { parent.width - 34 }, y = 8, width = 26, height = 24, cornerRadius = 7,
+        fill = { this.hovered ? 0xFFFFFF40 : 0xFFFFFF26 }, cursor = "pointer", tooltipLabel = "Other versions on GitHub",
+        onClick() { app.launcher.openForks(classroot.appId, this) },
+        ForkMark [ x = center, y = center, ink = #FFFFFF ] ]
+    ]
+
+// the last tile: ask the assistant for a new app
+class NewTile extends Control [ width = 150, height = 156, cornerRadius = 18,
+    fill = { this.hovered ? 0xFFFFFF1F : 0xFFFFFF00 },
+    press() { app.askAssistant("Make me a ") },
+    plate: View [ x = center, y = 16, width = 76, height = 76, cornerRadius = 17.5,
+        stroke = { stroke(2, 0xFFFFFF59) },
+        Text [ x = center, y = center, fontSize = 34, textColor = #FFFFFFB3, text = "+" ] ],
+    Text [ x = center, y = 100, fontSize = 14, fontWeight = semibold, textColor = #FFFFFFCC, text = "New app" ],
+    Text [ x = center, y = 120, fontSize = 11.5, textColor = #FFFFFF8C, text = "ask the assistant" ]
+    ]
